@@ -44,30 +44,6 @@ h1 {
   letter-spacing: 0.18em;
 }
 
-.score {
-  margin: -6px 0 16px;
-  font-size: 1.1rem;
-  font-weight: 700;
-  color: #f8fafc;
-}
-
-.sensitivity-wrap {
-  margin: 0 0 14px;
-  text-align: left;
-}
-
-.sensitivity-wrap label {
-  display: block;
-  margin-bottom: 8px;
-  font-size: 0.92rem;
-  color: #cbd5e1;
-  font-weight: 600;
-}
-
-.sensitivity-wrap input[type='range'] {
-  width: 100%;
-}
-
 .room-tag {
   font-size: 1.3rem;
   margin: 4px 0 22px;
@@ -84,12 +60,19 @@ h1 {
   background: #020617;
 }
 
-canvas {
+.scene-wrap {
   width: 100%;
-  max-width: 500px;
+  height: min(72vh, 620px);
   border-radius: 16px;
   border: 1px solid #334155;
-  background: #0f172a;
+  overflow: hidden;
+  background: #020617;
+}
+
+.scene-wrap canvas {
+  width: 100% !important;
+  height: 100% !important;
+  display: block;
 }
 
 .cta {
@@ -102,6 +85,12 @@ canvas {
   cursor: pointer;
   color: #02111f;
   background: linear-gradient(135deg, #22d3ee, #38bdf8);
+}
+
+.cta-secondary {
+  margin-top: 12px;
+  background: linear-gradient(135deg, #94a3b8, #64748b);
+  color: #f8fafc;
 }
 
 .copy-btn {
@@ -129,4 +118,25 @@ canvas {
 .status {
   margin: 16px 0 0;
   color: #cbd5e1;
+}
+
+.status.calibrated {
+  color: #22d3ee;
+  font-weight: 700;
+  animation: calibratedFlash 0.9s ease;
+}
+
+@keyframes calibratedFlash {
+  0% {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  20% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  100% {
+    opacity: 0.9;
+    transform: translateY(0);
+  }
 }

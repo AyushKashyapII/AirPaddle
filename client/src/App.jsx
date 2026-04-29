@@ -1,17 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import { QRCodeSVG } from 'qrcode.react';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { Environment, OrbitControls, useGLTF } from '@react-three/drei';
+import { Physics, useBox, useCylinder, useSphere } from '@react-three/cannon';
+import * as THREE from 'three';
 
 const socket = io('/', { path: '/socket.io' });
-const CANVAS_SIZE = 500;
-const PADDLE_WIDTH = 80;
-const PADDLE_HEIGHT = 14;
-const BALL_RADIUS = 7;
-const AI_Y = 24;
-const AI_MAX_SPEED = 3.2;
-const MAX_TILT_DEG = 25;
-const DEADZONE_DEG = 4;
-const SMOOTHING = 0.2;
+const TABLE_WIDTH = 8;
+const TABLE_LENGTH = 16;
+const TABLE_HEIGHT = 0.42;
+const TABLE_TOP_Y = TABLE_HEIGHT / 2;
 
 function generateRoomCode() {
   return Math.floor(1000 + Math.random() * 9000).toString();
@@ -25,15 +24,212 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function normalizeTilt(value) {
-  return clamp(value / MAX_TILT_DEG, -1, 1);
+function Table() {
+  const [ref] = useBox(() => ({
+    args: [TABLE_WIDTH, TABLE_HEIGHT, TABLE_LENGTH],
+    position: [0, 0, 0],
+    type: 'Static',
+  }));
+  return (
+    <mesh ref={ref} receiveShadow>
+      <boxGeometry args={[TABLE_WIDTH, TABLE_HEIGHT, TABLE_LENGTH]} />
+      <meshStandardMaterial color="#1f7a3d" />
+    </mesh>
+  );
 }
 
-function applyDeadzone(value, deadzoneRatio) {
-  if (Math.abs(value) < deadzoneRatio) return 0;
-  const sign = Math.sign(value);
-  const scaled = (Math.abs(value) - deadzoneRatio) / (1 - deadzoneRatio);
-  return sign * clamp(scaled, 0, 1);
+function Net() {
+  const [ref] = useBox(() => ({
+    args: [TABLE_WIDTH, 0.6, 0.12],
+    position: [0, 0.45, 0],
+    type: 'Static',
+  }));
+
+  return (
+    <mesh ref={ref} castShadow receiveShadow>
+      <boxGeometry args={[TABLE_WIDTH, 0.6, 0.12]} />
+      <meshStandardMaterial color="#cbd5e1" transparent opacity={0.5} />
+    </mesh>
+  );
+}
+
+function Bounds() {
+  useBox(() => ({ args: [0.2, 1.5, TABLE_LENGTH], position: [-TABLE_WIDTH / 2 - 0.1, 0.7, 0], type: 'Static' }));
+  useBox(() => ({ args: [0.2, 1.5, TABLE_LENGTH], position: [TABLE_WIDTH / 2 + 0.1, 0.7, 0], type: 'Static' }));
+  return null;
+}
+
+function PlayerPaddle({ gyro }) {
+  const { scene } = useGLTF('/paddle.glb');
+  const paddleModel = useMemo(() => scene.clone(true), [scene]);
+  const [ref, api] = useCylinder(() => ({
+    type: 'Kinematic',
+    args: [0.52, 0.52, 0.18, 28],
+    position: [0, TABLE_TOP_Y + 0.44, 5.8],
+  }));
+  const eulerLiveRef = useRef(new THREE.Euler());
+  const eulerBaseRef = useRef(new THREE.Euler());
+  const qLiveRef = useRef(new THREE.Quaternion());
+  const qBaseRef = useRef(new THREE.Quaternion());
+  const qRelativeRef = useRef(new THREE.Quaternion());
+  const qDefaultRef = useRef(new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI / 2, 0, 0)));
+  const qFinalRef = useRef(new THREE.Quaternion());
+  const eulerFinalRef = useRef(new THREE.Euler());
+
+  useFrame(() => {
+    const live = gyro.live;
+    const baseline = gyro.baseline;
+
+    const xTarget = clamp((live.gamma || 0) * 0.06, -TABLE_WIDTH / 2 + 0.8, TABLE_WIDTH / 2 - 0.8);
+    const zTarget = clamp(5.8 + (live.beta || 0) * 0.03, 2.2, 7.2);
+
+    eulerLiveRef.current.set(
+      THREE.MathUtils.degToRad(live.beta || 0),
+      THREE.MathUtils.degToRad(live.alpha || 0),
+      THREE.MathUtils.degToRad(-(live.gamma || 0)),
+      'YXZ',
+    );
+    eulerBaseRef.current.set(
+      THREE.MathUtils.degToRad(baseline.beta || 0),
+      THREE.MathUtils.degToRad(baseline.alpha || 0),
+      THREE.MathUtils.degToRad(-(baseline.gamma || 0)),
+      'YXZ',
+    );
+
+    qLiveRef.current.setFromEuler(eulerLiveRef.current);
+    qBaseRef.current.setFromEuler(eulerBaseRef.current);
+    qRelativeRef.current.copy(qBaseRef.current).invert().multiply(qLiveRef.current);
+    qFinalRef.current.multiplyQuaternions(qDefaultRef.current, qRelativeRef.current);
+    eulerFinalRef.current.setFromQuaternion(qFinalRef.current, 'YXZ');
+
+    api.position.set(xTarget, TABLE_TOP_Y + 0.44, zTarget);
+    api.rotation.set(eulerFinalRef.current.x, eulerFinalRef.current.y, eulerFinalRef.current.z);
+  });
+
+  return (
+    <group ref={ref}>
+      <group>
+        <primitive object={paddleModel} scale={0.38} position={[0, 0.12, -0.26]} />
+      </group>
+    </group>
+  );
+}
+
+function OpponentPaddle({ ballPositionRef }) {
+  const { scene } = useGLTF('/paddle.glb');
+  const paddleModel = useMemo(() => scene.clone(true), [scene]);
+  const [ref, api] = useCylinder(() => ({
+    type: 'Kinematic',
+    args: [0.52, 0.52, 0.18, 28],
+    position: [0, TABLE_TOP_Y + 0.44, -5.8],
+  }));
+  const opponentXRef = useRef(0);
+
+  useFrame(() => {
+    const targetX = clamp(ballPositionRef.current[0], -TABLE_WIDTH / 2 + 0.8, TABLE_WIDTH / 2 - 0.8);
+    const maxStep = 0.08;
+    const dx = clamp(targetX - opponentXRef.current, -maxStep, maxStep);
+    opponentXRef.current += dx;
+    api.position.set(opponentXRef.current, TABLE_TOP_Y + 0.44, -5.8);
+    api.rotation.set(Math.PI / 2, 0, 0);
+  });
+
+  return (
+    <group ref={ref}>
+      <group>
+        <primitive object={paddleModel} scale={0.38} position={[0, 0.12, -0.26]} />
+      </group>
+    </group>
+  );
+}
+
+function Ball({ ballPositionRef }) {
+  const [ref, api] = useSphere(() => ({
+    args: [0.05],
+    mass: 0.09,
+    position: [0, TABLE_TOP_Y + 0.22, -5.8],
+    material: {
+      restitution: 0.96,
+      friction: 0.03,
+    },
+    linearDamping: 0.03,
+    angularDamping: 0.04,
+    // Helps reduce tunneling through thin colliders at higher velocity.
+    collisionResponse: true,
+  }));
+  const ballPos = useRef([0, TABLE_TOP_Y + 0.22, -5.8]);
+
+  useEffect(
+    () =>
+      api.position.subscribe((p) => {
+        ballPos.current = p;
+        ballPositionRef.current = p;
+      }),
+    [api.position, ballPositionRef],
+  );
+
+  useEffect(() => {
+    const serve = () => {
+      api.position.set(0, TABLE_TOP_Y + 0.22, -5.8);
+      api.velocity.set((Math.random() - 0.5) * 0.8, 1.1, 6.5);
+      api.angularVelocity.set(0, 0, 0);
+    };
+    serve();
+    const timer = window.setInterval(() => {
+      const [, y, z] = ballPos.current;
+      if (y < -3 || z > 11 || z < -11) {
+        serve();
+      }
+    }, 120);
+    return () => window.clearInterval(timer);
+  }, [api]);
+
+  return (
+    <mesh ref={ref} castShadow>
+      <sphereGeometry args={[0.05, 32, 32]} />
+      <meshStandardMaterial color="white" roughness={0.2} />
+    </mesh>
+  );
+}
+
+function CameraRig() {
+  const { camera } = useThree();
+  useEffect(() => {
+    camera.position.set(0, 4.2, 10.4);
+    camera.lookAt(0, 0.5, 0);
+  }, [camera]);
+  return null;
+}
+
+function DesktopScene({ gyro }) {
+  const ballPositionRef = useRef([0, 2.2, -5.8]);
+
+  return (
+    <Canvas shadows camera={{ fov: 52, near: 0.1, far: 100 }}>
+      <color attach="background" args={['#020617']} />
+      <ambientLight intensity={0.45} />
+      <directionalLight
+        position={[5, 10, 5]}
+        intensity={1.15}
+        castShadow
+        shadow-mapSize-width={1024}
+        shadow-mapSize-height={1024}
+      />
+      <CameraRig />
+      <Suspense fallback={null}>
+        <Environment preset="city" />
+        <Physics gravity={[0, -9.81, 0]}>
+          <Table />
+          <Net />
+          <Bounds />
+          <PlayerPaddle gyro={gyro} />
+          <OpponentPaddle ballPositionRef={ballPositionRef} />
+          <Ball ballPositionRef={ballPositionRef} />
+        </Physics>
+      </Suspense>
+      <OrbitControls enablePan={false} enableZoom={false} minPolarAngle={0.9} maxPolarAngle={1.25} />
+    </Canvas>
+  );
 }
 
 function App() {
@@ -42,44 +238,16 @@ function App() {
   const [controllerReady, setControllerReady] = useState(false);
   const [status, setStatus] = useState('Tap to connect');
   const [copied, setCopied] = useState(false);
-  const [score, setScore] = useState({ player: 0, ai: 0 });
   const [controllerLinked, setControllerLinked] = useState(false);
-  const [sensitivity, setSensitivity] = useState(1.2);
-  const [paddlePos, setPaddlePos] = useState({
-    x: CANVAS_SIZE / 2 - PADDLE_WIDTH / 2,
-    y: CANVAS_SIZE - 42,
+  const [gyro, setGyro] = useState({
+    live: { alpha: 0, beta: 0, gamma: 0 },
+    baseline: { alpha: 0, beta: 0, gamma: 0 },
   });
-  const canvasRef = useRef(null);
+  const [calibratedFlash, setCalibratedFlash] = useState(false);
   const sendIntervalRef = useRef(null);
   const orientationHandlerRef = useRef(null);
   const latestGyroRef = useRef({ alpha: 0, beta: 0, gamma: 0 });
-  const animationFrameRef = useRef(null);
-  const playerPaddleRef = useRef({
-    x: CANVAS_SIZE / 2 - PADDLE_WIDTH / 2,
-    y: CANVAS_SIZE - 42,
-    width: PADDLE_WIDTH,
-    height: PADDLE_HEIGHT,
-  });
-  const aiPaddleRef = useRef({
-    x: CANVAS_SIZE / 2 - PADDLE_WIDTH / 2,
-    y: AI_Y,
-    width: PADDLE_WIDTH,
-    height: PADDLE_HEIGHT,
-  });
-  const ballRef = useRef({
-    x: CANVAS_SIZE / 2,
-    y: CANVAS_SIZE / 2,
-    vx: 1.8,
-    vy: 1.8,
-    radius: BALL_RADIUS,
-  });
-  const servePauseUntilRef = useRef(0);
-  const controlRef = useRef({
-    baselineBeta: null,
-    baselineGamma: null,
-    smoothX: 0,
-    smoothY: 0,
-  });
+  const calibrationOffsetRef = useRef({ alpha: 0, beta: 0, gamma: 0 });
 
   const urlRoom = useMemo(() => new URLSearchParams(window.location.search).get('room') || '', []);
   const mobileView = useMemo(() => Boolean(urlRoom) || isMobileDevice(), [urlRoom]);
@@ -116,146 +284,38 @@ function App() {
   useEffect(() => {
     if (mobileView || !roomCode) return;
     joinRoom(roomCode);
-    const onGyroData = ({ beta, gamma }) => {
+    const onGyroData = ({ alpha, beta, gamma }) => {
       setControllerLinked(true);
-      if (controlRef.current.baselineBeta === null || controlRef.current.baselineGamma === null) {
-        controlRef.current.baselineBeta = beta ?? 0;
-        controlRef.current.baselineGamma = gamma ?? 0;
-      }
-
-      const relativeBeta = (beta ?? 0) - controlRef.current.baselineBeta;
-      const relativeGamma = (gamma ?? 0) - controlRef.current.baselineGamma;
-      const deadzoneRatio = DEADZONE_DEG / MAX_TILT_DEG;
-
-      const targetX = applyDeadzone(normalizeTilt(relativeGamma), deadzoneRatio);
-      const targetY = applyDeadzone(normalizeTilt(relativeBeta), deadzoneRatio);
-
-      controlRef.current.smoothX += (targetX - controlRef.current.smoothX) * SMOOTHING;
-      controlRef.current.smoothY += (targetY - controlRef.current.smoothY) * SMOOTHING;
-
-      const speed = 9 * sensitivity;
-      setPaddlePos((prev) => ({
-        x: clamp(prev.x + controlRef.current.smoothX * speed, 0, CANVAS_SIZE - PADDLE_WIDTH),
-        y: clamp(prev.y + controlRef.current.smoothY * speed, AI_Y + 24, CANVAS_SIZE - 20),
+      setGyro({
+        live: {
+          alpha: alpha ?? 0,
+          beta: beta ?? 0,
+          gamma: gamma ?? 0,
+        },
+        baseline: calibrationOffsetRef.current,
+      });
+    };
+    const onCalibrationOffset = ({ alpha, beta, gamma }) => {
+      calibrationOffsetRef.current = {
+        alpha: alpha ?? 0,
+        beta: beta ?? 0,
+        gamma: gamma ?? 0,
+      };
+      setGyro((prev) => ({
+        ...prev,
+        baseline: calibrationOffsetRef.current,
       }));
+      setCalibratedFlash(true);
+      window.setTimeout(() => setCalibratedFlash(false), 1000);
     };
 
     socket.on('gyro_data', onGyroData);
-    return () => socket.off('gyro_data', onGyroData);
-  }, [mobileView, roomCode, sensitivity]);
-
-  useEffect(() => {
-    playerPaddleRef.current = {
-      ...playerPaddleRef.current,
-      x: paddlePos.x,
-      y: paddlePos.y,
-    };
-  }, [paddlePos]);
-
-  useEffect(() => {
-    if (mobileView || !canvasRef.current) return;
-    const ctx = canvasRef.current.getContext('2d');
-
-    const resetBall = (serveDirection) => {
-      const baseSpeed = 1.8;
-      const randomX = (Math.random() - 0.5) * 1.1;
-      ballRef.current = {
-        ...ballRef.current,
-        x: CANVAS_SIZE / 2,
-        y: CANVAS_SIZE / 2,
-        vx: randomX,
-        vy: serveDirection * baseSpeed,
-      };
-      servePauseUntilRef.current = performance.now() + 1000;
-    };
-
-    const bounceOnPaddle = (paddle, movingDown) => {
-      const ball = ballRef.current;
-      const withinX = ball.x + ball.radius >= paddle.x && ball.x - ball.radius <= paddle.x + paddle.width;
-      const withinY = ball.y + ball.radius >= paddle.y && ball.y - ball.radius <= paddle.y + paddle.height;
-      if (!withinX || !withinY) return false;
-      if (movingDown && ball.vy < 0) return false;
-      if (!movingDown && ball.vy > 0) return false;
-
-      const hitOffset = (ball.x - (paddle.x + paddle.width / 2)) / (paddle.width / 2);
-      ball.vx += hitOffset * 1.2;
-      ball.vx = clamp(ball.vx, -4.2, 4.2);
-      ball.vy = movingDown ? -Math.abs(ball.vy) : Math.abs(ball.vy);
-      ball.y = movingDown ? paddle.y - ball.radius : paddle.y + paddle.height + ball.radius;
-      return true;
-    };
-
-    const renderFrame = () => {
-      const now = performance.now();
-      const ball = ballRef.current;
-      const player = playerPaddleRef.current;
-      const ai = aiPaddleRef.current;
-
-      const aiTargetX = clamp(ball.x - ai.width / 2, 0, CANVAS_SIZE - ai.width);
-      const aiDelta = clamp(aiTargetX - ai.x, -AI_MAX_SPEED, AI_MAX_SPEED);
-      ai.x += aiDelta;
-
-      if (now >= servePauseUntilRef.current) {
-        ball.x += ball.vx;
-        ball.y += ball.vy;
-
-        if (ball.x - ball.radius <= 0) {
-          ball.x = ball.radius;
-          ball.vx *= -1;
-        }
-        if (ball.x + ball.radius >= CANVAS_SIZE) {
-          ball.x = CANVAS_SIZE - ball.radius;
-          ball.vx *= -1;
-        }
-
-        bounceOnPaddle(player, true);
-        bounceOnPaddle(ai, false);
-
-        if (ball.y - ball.radius <= 0) {
-          setScore((prev) => ({ ...prev, player: prev.player + 1 }));
-          resetBall(1);
-        } else if (ball.y + ball.radius >= CANVAS_SIZE) {
-          setScore((prev) => ({ ...prev, ai: prev.ai + 1 }));
-          resetBall(-1);
-        }
-      }
-
-      ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
-      ctx.fillStyle = '#0f172a';
-      ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
-      ctx.strokeStyle = '#334155';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
-
-      ctx.fillStyle = '#f59e0b';
-      ctx.fillRect(ai.x, ai.y, ai.width, ai.height);
-      ctx.fillStyle = '#38bdf8';
-      ctx.fillRect(player.x, player.y, player.width, player.height);
-
-      ctx.beginPath();
-      ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
-      ctx.fillStyle = '#f8fafc';
-      ctx.fill();
-
-      if (now < servePauseUntilRef.current) {
-        ctx.fillStyle = '#cbd5e1';
-        ctx.font = '600 16px Inter, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('Serve in 1...', CANVAS_SIZE / 2, CANVAS_SIZE / 2 + 32);
-      }
-
-      animationFrameRef.current = window.requestAnimationFrame(renderFrame);
-    };
-
-    resetBall(Math.random() > 0.5 ? 1 : -1);
-    animationFrameRef.current = window.requestAnimationFrame(renderFrame);
-
+    socket.on('calibration_offset', onCalibrationOffset);
     return () => {
-      if (animationFrameRef.current) {
-        window.cancelAnimationFrame(animationFrameRef.current);
-      }
+      socket.off('gyro_data', onGyroData);
+      socket.off('calibration_offset', onCalibrationOffset);
     };
-  }, [mobileView]);
+  }, [mobileView, roomCode]);
 
   const requestOrientationPermission = async () => {
     if (!window.isSecureContext) {
@@ -320,6 +380,16 @@ function App() {
     }
   };
 
+  const calibrateController = () => {
+    if (!roomCode) return;
+    const baseline = { ...latestGyroRef.current };
+    socket.emit('calibration_offset', {
+      roomCode,
+      ...baseline,
+    });
+    setStatus('Calibrated. Current phone angle is now neutral.');
+  };
+
   useEffect(() => {
     return () => {
       if (sendIntervalRef.current) {
@@ -353,6 +423,9 @@ function App() {
           <button className="cta" onClick={startController} disabled={!connected || controllerReady}>
             Connect & Calibrate
           </button>
+          <button className="cta cta-secondary" onClick={calibrateController} disabled={!controllerReady}>
+            Calibrate / Recenter
+          </button>
           <p className="status">{status}</p>
         </section>
       </main>
@@ -364,19 +437,6 @@ function App() {
       <section className="panel">
         <h1>AirPaddle Screen</h1>
         <p className="code">{roomCode || '----'}</p>
-        <p className="score">Player {score.player} : {score.ai} AI</p>
-        <div className="sensitivity-wrap">
-          <label htmlFor="sensitivity">Sensitivity {sensitivity.toFixed(1)}x</label>
-          <input
-            id="sensitivity"
-            type="range"
-            min="0.6"
-            max="2"
-            step="0.1"
-            value={sensitivity}
-            onChange={(event) => setSensitivity(Number(event.target.value))}
-          />
-        </div>
         {!controllerLinked && roomCode && (
           <>
             <div className="qr-wrap">
@@ -388,10 +448,15 @@ function App() {
           </>
         )}
         {controllerLinked && <p className="status">Controller connected</p>}
-        <canvas ref={canvasRef} width={CANVAS_SIZE} height={CANVAS_SIZE} />
+        {calibratedFlash && <p className="status calibrated">Calibrated!</p>}
+        <div className="scene-wrap">
+          <DesktopScene gyro={gyro} />
+        </div>
       </section>
     </main>
   );
 }
+
+useGLTF.preload('/paddle.glb');
 
 export default App;

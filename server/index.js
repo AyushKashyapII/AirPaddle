@@ -40,6 +40,16 @@ io.on('connection', (socket) => {
       timestamp: timestamp ?? Date.now(),
     });
   });
+
+  socket.on('calibration_offset', ({ roomCode, alpha = 0, beta = 0, gamma = 0 }) => {
+    if (!roomCode) return;
+    socket.to(roomCode).emit('calibration_offset', {
+      alpha,
+      beta,
+      gamma,
+      timestamp: Date.now(),
+    });
+  });
 });
 
 const PORT = process.env.PORT || 3001;

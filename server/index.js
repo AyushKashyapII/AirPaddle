@@ -41,6 +41,15 @@ io.on('connection', (socket) => {
     });
   });
 
+  socket.on('paddle_move', ({ roomCode, dx = 0, dy = 0, timestamp }) => {
+    if (!roomCode) return;
+    socket.to(roomCode).emit('paddle_move', {
+      dx,
+      dy,
+      timestamp: timestamp ?? Date.now(),
+    });
+  });
+
   socket.on('calibration_offset', ({ roomCode, alpha = 0, beta = 0, gamma = 0 }) => {
     if (!roomCode) return;
     socket.to(roomCode).emit('calibration_offset', {

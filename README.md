@@ -49,3 +49,5 @@ Then open:
 4. Use QR or "Copy Controller Link" for your phone.
 
 The Vite dev server is configured to allow ngrok hosts and proxy `/socket.io` to `localhost:3001`.
+
+TRYING RL first 

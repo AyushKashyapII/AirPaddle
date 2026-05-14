@@ -16,6 +16,13 @@ const PADDLE_THICKNESS = 0.18;
 const PADDLE_TABLE_CLEARANCE = 0.26;
 const PADDLE_Y_MIN = TABLE_TOP_Y + PADDLE_RADIUS + PADDLE_TABLE_CLEARANCE;
 const PADDLE_BASE_Y = PADDLE_Y_MIN + 0.12;
+const BALL_RADIUS = 0.05;
+const PADDLE_HIT_RADIUS = PADDLE_RADIUS * 1.12;
+const PADDLE_HIT_DEPTH = PADDLE_THICKNESS * 0.8 + BALL_RADIUS;
+const PADDLE_HIT_COOLDOWN_MS = 120;
+const BALL_MIN_REBOUND_SPEED = 6.4;
+const BALL_MAX_REBOUND_SPEED = 12.5;
+const BALL_PADDLE_SPEED_BOOST = 1.08;
 const PADDLE_X_MIN = -2;
 const PADDLE_X_MAX = 2;
 const PADDLE_Y_MAX = 3.2;
@@ -60,6 +67,15 @@ function applyDeadzone(value, deadzone) {
   return value > 0 ? value - deadzone : value + deadzone;
 }
 
+function createPaddlePose(z) {
+  return {
+    position: new THREE.Vector3(0, PADDLE_BASE_Y, z),
+    quaternion: new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(PADDLE_NEUTRAL_ROTATION.x, PADDLE_NEUTRAL_ROTATION.y, PADDLE_NEUTRAL_ROTATION.z, 'YXZ'),
+    ),
+  };
+}
+
 function Table() {
   const [ref] = useBox(() => ({
     args: [TABLE_WIDTH, TABLE_HEIGHT, TABLE_LENGTH],
@@ -99,7 +115,7 @@ function Bounds() {
   return null;
 }
 
-function PlayerPaddle({ gyroRef, targetPositionRef, calibrated }) {
+function PlayerPaddle({ gyroRef, targetPositionRef, calibrated, paddlePoseRef }) {
   const { scene } = useGLTF('/paddle.glb');
   const paddleModel = useMemo(() => scene.clone(true), [scene]);
   const [ref, api] = useCylinder(() => ({
@@ -121,17 +137,11 @@ function PlayerPaddle({ gyroRef, targetPositionRef, calibrated }) {
     const gyro = gyroRef.current;
     const targetPosition = calibrated ? targetPositionRef.current : { x: 0, y: PADDLE_BASE_Y };
     const live = gyro.live;
-    const baseline = gyro.baseline;
+    const baseline = calibrated ? gyro.baseline : gyro.previewBaseline;
 
-    const pitchDelta = calibrated
-      ? applyDeadzone(angleDeltaDegrees(live.beta || 0, baseline.beta || 0), PHONE_DEADZONE_DEG)
-      : 0;
-    const yawDelta = calibrated
-      ? applyDeadzone(angleDeltaDegrees(live.alpha || 0, baseline.alpha || 0), PHONE_DEADZONE_DEG)
-      : 0;
-    const rollDelta = calibrated
-      ? applyDeadzone(angleDeltaDegrees(live.gamma || 0, baseline.gamma || 0), PHONE_DEADZONE_DEG)
-      : 0;
+    const pitchDelta = applyDeadzone(angleDeltaDegrees(live.beta || 0, baseline.beta || 0), PHONE_DEADZONE_DEG);
+    const yawDelta = applyDeadzone(angleDeltaDegrees(live.alpha || 0, baseline.alpha || 0), PHONE_DEADZONE_DEG);
+    const rollDelta = applyDeadzone(angleDeltaDegrees(live.gamma || 0, baseline.gamma || 0), PHONE_DEADZONE_DEG);
 
     eulerTargetRef.current.set(
       PADDLE_NEUTRAL_ROTATION.x + clamp(pitchDelta * PITCH_SENSITIVITY, -PADDLE_LIMITS.pitch, PADDLE_LIMITS.pitch),
@@ -149,6 +159,8 @@ function PlayerPaddle({ gyroRef, targetPositionRef, calibrated }) {
     smoothedPositionRef.current.y = THREE.MathUtils.damp(smoothedPositionRef.current.y, yPos, POSITION_SMOOTHING, delta);
     api.position.set(smoothedPositionRef.current.x, smoothedPositionRef.current.y, 5.8);
     api.rotation.set(eulerSmoothedRef.current.x, eulerSmoothedRef.current.y, eulerSmoothedRef.current.z);
+    paddlePoseRef.current.position.set(smoothedPositionRef.current.x, smoothedPositionRef.current.y, 5.8);
+    paddlePoseRef.current.quaternion.copy(qSmoothedRef.current);
   });
 
   return (
@@ -160,7 +172,7 @@ function PlayerPaddle({ gyroRef, targetPositionRef, calibrated }) {
   );
 }
 
-function OpponentPaddle({ ballPositionRef }) {
+function OpponentPaddle({ ballPositionRef, paddlePoseRef }) {
   const { scene } = useGLTF('/paddle.glb');
   const paddleModel = useMemo(() => scene.clone(true), [scene]);
   const [ref, api] = useCylinder(() => ({
@@ -169,6 +181,11 @@ function OpponentPaddle({ ballPositionRef }) {
     position: [0, PADDLE_BASE_Y, -5.8],
   }));
   const opponentXRef = useRef(0);
+  const qOpponentRef = useRef(
+    new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(PADDLE_NEUTRAL_ROTATION.x, PADDLE_NEUTRAL_ROTATION.y, PADDLE_NEUTRAL_ROTATION.z, 'YXZ'),
+    ),
+  );
 
   useFrame(() => {
     const targetX = clamp(ballPositionRef.current[0], -TABLE_WIDTH / 2 + 0.8, TABLE_WIDTH / 2 - 0.8);
@@ -177,6 +194,8 @@ function OpponentPaddle({ ballPositionRef }) {
     opponentXRef.current += dx;
     api.position.set(opponentXRef.current, PADDLE_BASE_Y, -5.8);
     api.rotation.set(Math.PI / 2, 0, 0);
+    paddlePoseRef.current.position.set(opponentXRef.current, PADDLE_BASE_Y, -5.8);
+    paddlePoseRef.current.quaternion.copy(qOpponentRef.current);
   });
 
   return (
@@ -188,9 +207,9 @@ function OpponentPaddle({ ballPositionRef }) {
   );
 }
 
-function Ball({ ballPositionRef, serveSignal }) {
+function Ball({ ballPositionRef, playerPaddlePoseRef, opponentPaddlePoseRef, serveSignal }) {
   const [ref, api] = useSphere(() => ({
-    args: [0.05],
+    args: [BALL_RADIUS],
     mass: 0.09,
     position: [0, TABLE_TOP_Y + 0.22, -5.8],
     material: {
@@ -203,6 +222,14 @@ function Ball({ ballPositionRef, serveSignal }) {
     collisionResponse: true,
   }));
   const ballPos = useRef([0, TABLE_TOP_Y + 0.22, -5.8]);
+  const ballVelocityRef = useRef([0, 0, 0]);
+  const lastHitAtRef = useRef(0);
+  const ballVectorRef = useRef(new THREE.Vector3());
+  const velocityVectorRef = useRef(new THREE.Vector3());
+  const normalRef = useRef(new THREE.Vector3());
+  const relativeRef = useRef(new THREE.Vector3());
+  const projectedRef = useRef(new THREE.Vector3());
+  const reflectedRef = useRef(new THREE.Vector3());
 
   useEffect(
     () =>
@@ -211,6 +238,14 @@ function Ball({ ballPositionRef, serveSignal }) {
         ballPositionRef.current = p;
       }),
     [api.position, ballPositionRef],
+  );
+
+  useEffect(
+    () =>
+      api.velocity.subscribe((v) => {
+        ballVelocityRef.current = v;
+      }),
+    [api.velocity],
   );
 
   const serve = () => {
@@ -236,9 +271,55 @@ function Ball({ ballPositionRef, serveSignal }) {
     }
   }, [serveSignal]);
 
+  const hitPaddleDisc = (paddlePose, now) => {
+    if (now - lastHitAtRef.current < PADDLE_HIT_COOLDOWN_MS) return false;
+
+    const ball = ballVectorRef.current.fromArray(ballPos.current);
+    const velocity = velocityVectorRef.current.fromArray(ballVelocityRef.current);
+    const speed = velocity.length();
+    if (speed < 0.01) return false;
+
+    const normal = normalRef.current.set(0, 1, 0).applyQuaternion(paddlePose.quaternion).normalize();
+    const relative = relativeRef.current.copy(ball).sub(paddlePose.position);
+    const planeDistance = relative.dot(normal);
+    if (Math.abs(planeDistance) > PADDLE_HIT_DEPTH) return false;
+
+    const projected = projectedRef.current.copy(relative).addScaledVector(normal, -planeDistance);
+    if (projected.length() > PADDLE_HIT_RADIUS) return false;
+
+    const movingThroughDisc = velocity.dot(normal) * planeDistance < 0 || Math.abs(planeDistance) < BALL_RADIUS * 1.5;
+    if (!movingThroughDisc) return false;
+
+    if (velocity.dot(normal) > 0) {
+      normal.multiplyScalar(-1);
+    }
+
+    const reflected = reflectedRef.current.copy(velocity).reflect(normal);
+    reflected.y = Math.max(reflected.y + 0.85, 2.2);
+    reflected.x += clamp(projected.x * 1.4, -1.1, 1.1);
+
+    const reboundSpeed = clamp(Math.max(speed * BALL_PADDLE_SPEED_BOOST, BALL_MIN_REBOUND_SPEED), BALL_MIN_REBOUND_SPEED, BALL_MAX_REBOUND_SPEED);
+    reflected.normalize().multiplyScalar(reboundSpeed);
+
+    const correctedPosition = paddlePose.position
+      .clone()
+      .add(projected)
+      .addScaledVector(normal, BALL_RADIUS + PADDLE_HIT_DEPTH);
+    api.position.set(correctedPosition.x, correctedPosition.y, correctedPosition.z);
+    api.velocity.set(reflected.x, reflected.y, reflected.z);
+    api.angularVelocity.set(reflected.z * 0.6, 0, -reflected.x * 0.6);
+    lastHitAtRef.current = now;
+    return true;
+  };
+
+  useFrame(() => {
+    const now = performance.now();
+    hitPaddleDisc(playerPaddlePoseRef.current, now) || hitPaddleDisc(opponentPaddlePoseRef.current, now);
+  });
+
   return (
     <mesh ref={ref} castShadow>
-      <sphereGeometry args={[0.05, 32, 32]} />
+      <sphereGeometry args={[BALL_RADIUS, 32, 32]} />
       <meshStandardMaterial color="white" roughness={0.2} />
     </mesh>
   );
@@ -288,6 +369,8 @@ function CalibrationGuide({ visible }) {
 
 function DesktopScene({ gyroRef, targetPositionRef, serveSignal, controllerLinked, calibrated }) {
   const ballPositionRef = useRef([0, 2.2, -5.8]);
+  const playerPaddlePoseRef = useRef(createPaddlePose(5.8));
+  const opponentPaddlePoseRef = useRef(createPaddlePose(-5.8));
 
   return (
     <Canvas shadows camera={{ fov: 52, near: 0.1, far: 100 }}>
@@ -307,9 +390,19 @@ function DesktopScene({ gyroRef, targetPositionRef, serveSignal, controllerLinke
           <Table />
           <Net />
           <Bounds />
-          <PlayerPaddle gyroRef={gyroRef} targetPositionRef={targetPositionRef} calibrated={calibrated} />
-          <OpponentPaddle ballPositionRef={ballPositionRef} />
-          <Ball ballPositionRef={ballPositionRef} serveSignal={serveSignal} />
+          <PlayerPaddle
+            gyroRef={gyroRef}
+            targetPositionRef={targetPositionRef}
+            calibrated={calibrated}
+            paddlePoseRef={playerPaddlePoseRef}
+          />
+          <OpponentPaddle ballPositionRef={ballPositionRef} paddlePoseRef={opponentPaddlePoseRef} />
+          <Ball
+            ballPositionRef={ballPositionRef}
+            playerPaddlePoseRef={playerPaddlePoseRef}
+            opponentPaddlePoseRef={opponentPaddlePoseRef}
+            serveSignal={serveSignal}
+          />
         </Physics>
         <CalibrationGuide visible={controllerLinked && !calibrated} />
       </Suspense>
@@ -329,6 +422,7 @@ function App() {
   const gyroRef = useRef({
     live: { alpha: 0, beta: 0, gamma: 0 },
     baseline: { alpha: 0, beta: 0, gamma: 0 },
+    previewBaseline: { alpha: 0, beta: 0, gamma: 0 },
   });
   const paddleTargetRef = useRef({ x: 0, y: PADDLE_BASE_Y });
   const [serveSignal, setServeSignal] = useState(0);
@@ -338,6 +432,7 @@ function App() {
   const orientationHandlerRef = useRef(null);
   const latestGyroRef = useRef({ alpha: 0, beta: 0, gamma: 0 });
   const calibrationOffsetRef = useRef({ alpha: 0, beta: 0, gamma: 0 });
+  const previewBaselineRef = useRef(null);
   const calibratedRef = useRef(false);
   const trackpadTouchRef = useRef(null);
   const controllerLinkedRef = useRef(false);
@@ -383,17 +478,23 @@ function App() {
   useEffect(() => {
     if (mobileView || !roomCode) return;
     calibratedRef.current = false;
+    previewBaselineRef.current = null;
     setCalibrated(false);
     joinRoom(roomCode);
     const onGyroData = ({ alpha, beta, gamma }) => {
       markControllerLinked();
+      const live = {
+        alpha: alpha ?? 0,
+        beta: beta ?? 0,
+        gamma: gamma ?? 0,
+      };
+      if (!previewBaselineRef.current) {
+        previewBaselineRef.current = live;
+      }
       gyroRef.current = {
-        live: {
-          alpha: alpha ?? 0,
-          beta: beta ?? 0,
-          gamma: gamma ?? 0,
-        },
+        live,
         baseline: calibrationOffsetRef.current,
+        previewBaseline: previewBaselineRef.current,
       };
     };
     const onCalibrationOffset = ({ alpha, beta, gamma }) => {
@@ -405,6 +506,7 @@ function App() {
       gyroRef.current = {
         ...gyroRef.current,
         baseline: calibrationOffsetRef.current,
+        previewBaseline: calibrationOffsetRef.current,
       };
       paddleTargetRef.current = { x: 0, y: PADDLE_BASE_Y };
       calibratedRef.current = true;
@@ -620,7 +722,7 @@ function App() {
             </button>
           </>
         )}
-        {controllerLinked && !calibrated && <p className="status">Hold your phone naturally, then set neutral.</p>}
+        {controllerLinked && !calibrated && <p className="status">Tilt to preview, then set neutral from a comfortable pose.</p>}
         {controllerLinked && calibrated && <p className="status">Controller calibrated</p>}
         {calibratedFlash && <p className="status calibrated">Calibrated!</p>}
         <div className={`scene-wrap ${controllerLinked ? 'scene-wrap-expanded' : ''}`}>

@@ -18,7 +18,10 @@ const PADDLE_Y_MIN = 0.5;
 const PADDLE_Y_MAX = 3;
 const NET_HEIGHT = 0.16;
 const NET_THICKNESS = 0.06;
-
+const ORIENTATION_SMOOTHING = 10;
+const POSITION_SMOOTHING = 20;
+const CONTROLLER_SEND_INTERVAL_MS = 16;
+ 
 function generateRoomCode() {
   return Math.floor(1000 + Math.random() * 9000).toString();
 }
@@ -70,7 +73,7 @@ function Bounds() {
   return null;
 }
 
-function PlayerPaddle({ gyro, targetPosition }) {
+function PlayerPaddle({ gyroRef, targetPositionRef }) {
   const { scene } = useGLTF('/paddle.glb');
   const paddleModel = useMemo(() => scene.clone(true), [scene]);
   const [ref, api] = useCylinder(() => ({
@@ -85,9 +88,14 @@ function PlayerPaddle({ gyro, targetPosition }) {
   const qRelativeRef = useRef(new THREE.Quaternion());
   const qDefaultRef = useRef(new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI / 2, 0, 0)));
   const qFinalRef = useRef(new THREE.Quaternion());
+  const qSmoothedRef = useRef(new THREE.Quaternion().copy(qDefaultRef.current));
   const eulerFinalRef = useRef(new THREE.Euler());
+  const eulerSmoothedRef = useRef(new THREE.Euler());
+  const smoothedPositionRef = useRef({ x: 0, y: PADDLE_BASE_Y });
 
-  useFrame(() => {
+  useFrame((_, delta) => {
+    const gyro = gyroRef.current;
+    const targetPosition = targetPositionRef.current;
     const live = gyro.live;
     const baseline = gyro.baseline;
 
@@ -112,11 +120,16 @@ function PlayerPaddle({ gyro, targetPosition }) {
     eulerFinalRef.current.x = clamp(eulerFinalRef.current.x, Math.PI / 2 - 0.45, Math.PI / 2 + 0.45);
     eulerFinalRef.current.y = clamp(eulerFinalRef.current.y, -0.55, 0.55);
     eulerFinalRef.current.z = clamp(eulerFinalRef.current.z, -0.45, 0.45);
+    qFinalRef.current.setFromEuler(eulerFinalRef.current);
+    qSmoothedRef.current.slerp(qFinalRef.current, 1 - Math.exp(-ORIENTATION_SMOOTHING * delta));
+    eulerSmoothedRef.current.setFromQuaternion(qSmoothedRef.current, 'YXZ');
 
     const xPos = clamp(targetPosition.x, PADDLE_X_MIN, PADDLE_X_MAX);
     const yPos = clamp(targetPosition.y, PADDLE_Y_MIN, PADDLE_Y_MAX);
-    api.position.set(xPos, yPos, 5.8);
-    api.rotation.set(eulerFinalRef.current.x, eulerFinalRef.current.y, eulerFinalRef.current.z);
+    smoothedPositionRef.current.x = THREE.MathUtils.damp(smoothedPositionRef.current.x, xPos, POSITION_SMOOTHING, delta);
+    smoothedPositionRef.current.y = THREE.MathUtils.damp(smoothedPositionRef.current.y, yPos, POSITION_SMOOTHING, delta);
+    api.position.set(smoothedPositionRef.current.x, smoothedPositionRef.current.y, 5.8);
+    api.rotation.set(eulerSmoothedRef.current.x, eulerSmoothedRef.current.y, eulerSmoothedRef.current.z);
   });
 
   return (
@@ -221,7 +234,7 @@ function CameraRig() {
   return null;
 }
 
-function DesktopScene({ gyro, targetPosition, serveSignal }) {
+function DesktopScene({ gyroRef, targetPositionRef, serveSignal }) {
   const ballPositionRef = useRef([0, 2.2, -5.8]);
 
   return (
@@ -242,7 +255,7 @@ function DesktopScene({ gyro, targetPosition, serveSignal }) {
           <Table />
           <Net />
           <Bounds />
-          <PlayerPaddle gyro={gyro} targetPosition={targetPosition} />
+          <PlayerPaddle gyroRef={gyroRef} targetPositionRef={targetPositionRef} />
           <OpponentPaddle ballPositionRef={ballPositionRef} />
           <Ball ballPositionRef={ballPositionRef} serveSignal={serveSignal} />
         </Physics>
@@ -259,24 +272,33 @@ function App() {
   const [status, setStatus] = useState('Tap to connect');
   const [copied, setCopied] = useState(false);
   const [controllerLinked, setControllerLinked] = useState(false);
-  const [gyro, setGyro] = useState({
+  const gyroRef = useRef({
     live: { alpha: 0, beta: 0, gamma: 0 },
     baseline: { alpha: 0, beta: 0, gamma: 0 },
   });
-  const [paddleTarget, setPaddleTarget] = useState({ x: 0, y: PADDLE_BASE_Y });
+  const paddleTargetRef = useRef({ x: 0, y: PADDLE_BASE_Y });
   const [serveSignal, setServeSignal] = useState(0);
   const [calibratedFlash, setCalibratedFlash] = useState(false);
-  const sendIntervalRef = useRef(null);
+  const sendFrameRef = useRef(null);
+  const lastSendAtRef = useRef(0);
   const orientationHandlerRef = useRef(null);
   const latestGyroRef = useRef({ alpha: 0, beta: 0, gamma: 0 });
+  const initialCalibrationSentRef = useRef(false);
   const calibrationOffsetRef = useRef({ alpha: 0, beta: 0, gamma: 0 });
   const trackpadTouchRef = useRef(null);
+  const controllerLinkedRef = useRef(false);
 
   const urlRoom = useMemo(() => new URLSearchParams(window.location.search).get('room') || '', []);
   const mobileView = useMemo(() => Boolean(urlRoom) || isMobileDevice(), [urlRoom]);
 
   const joinRoom = (targetRoom) => {
     socket.emit('join_room', { roomCode: targetRoom });
+  };
+
+  const markControllerLinked = () => {
+    if (controllerLinkedRef.current) return;
+    controllerLinkedRef.current = true;
+    setControllerLinked(true);
   };
 
   useEffect(() => {
@@ -308,15 +330,15 @@ function App() {
     if (mobileView || !roomCode) return;
     joinRoom(roomCode);
     const onGyroData = ({ alpha, beta, gamma }) => {
-      setControllerLinked(true);
-      setGyro({
+      markControllerLinked();
+      gyroRef.current = {
         live: {
           alpha: alpha ?? 0,
           beta: beta ?? 0,
           gamma: gamma ?? 0,
         },
         baseline: calibrationOffsetRef.current,
-      });
+      };
     };
     const onCalibrationOffset = ({ alpha, beta, gamma }) => {
       calibrationOffsetRef.current = {
@@ -324,20 +346,20 @@ function App() {
         beta: beta ?? 0,
         gamma: gamma ?? 0,
       };
-      setGyro((prev) => ({
-        ...prev,
+      gyroRef.current = {
+        ...gyroRef.current,
         baseline: calibrationOffsetRef.current,
-      }));
+      };
       setCalibratedFlash(true);
       window.setTimeout(() => setCalibratedFlash(false), 1000);
     };
     const onPaddleMove = ({ dx = 0, dy = 0 }) => {
-      setControllerLinked(true);
+      markControllerLinked();
       const moveScale = 0.01;
-      setPaddleTarget((prev) => ({
-        x: clamp(prev.x + dx * moveScale, PADDLE_X_MIN, PADDLE_X_MAX),
-        y: clamp(prev.y - dy * moveScale, PADDLE_Y_MIN, PADDLE_Y_MAX),
-      }));
+      paddleTargetRef.current = {
+        x: clamp(paddleTargetRef.current.x + dx * moveScale, PADDLE_X_MIN, PADDLE_X_MAX),
+        y: clamp(paddleTargetRef.current.y - dy * moveScale, PADDLE_Y_MIN, PADDLE_Y_MAX),
+      };
     };
 
     socket.on('gyro_data', onGyroData);
@@ -395,31 +417,49 @@ function App() {
       setStatus('Controller Connected - Tilt to move!');
       setControllerReady(true);
 
-      if (sendIntervalRef.current) {
-        window.clearInterval(sendIntervalRef.current);
+      if (sendFrameRef.current) {
+        window.cancelAnimationFrame(sendFrameRef.current);
+        sendFrameRef.current = null;
       }
       if (orientationHandlerRef.current) {
         window.removeEventListener('deviceorientation', orientationHandlerRef.current, true);
+        orientationHandlerRef.current = null;
       }
+      initialCalibrationSentRef.current = false;
 
       const onOrientation = (event) => {
-        latestGyroRef.current = {
+        const reading = {
           alpha: event.alpha ?? 0,
           beta: event.beta ?? 0,
           gamma: event.gamma ?? 0,
         };
+        latestGyroRef.current = reading;
+
+        if (!initialCalibrationSentRef.current) {
+          initialCalibrationSentRef.current = true;
+          socket.emit('calibration_offset', {
+            roomCode,
+            ...reading,
+          });
+        }
       };
       orientationHandlerRef.current = onOrientation;
 
       window.addEventListener('deviceorientation', onOrientation, true);
 
-      sendIntervalRef.current = window.setInterval(() => {
-        socket.emit('gyro_data', {
-          roomCode,
-          ...latestGyroRef.current,
-          timestamp: Date.now(),
-        });
-      }, 33);
+      const sendGyroFrame = (now) => {
+        if (now - lastSendAtRef.current >= CONTROLLER_SEND_INTERVAL_MS) {
+          lastSendAtRef.current = now;
+          socket.emit('gyro_data', {
+            roomCode,
+            ...latestGyroRef.current,
+            timestamp: Date.now(),
+          });
+        }
+        sendFrameRef.current = window.requestAnimationFrame(sendGyroFrame);
+      };
+      lastSendAtRef.current = 0;
+      sendFrameRef.current = window.requestAnimationFrame(sendGyroFrame);
     } catch {
       setStatus('Could not connect controller');
     }
@@ -464,16 +504,18 @@ function App() {
 
   useEffect(() => {
     return () => {
-      if (sendIntervalRef.current) {
-        window.clearInterval(sendIntervalRef.current);
+      if (sendFrameRef.current) {
+        window.cancelAnimationFrame(sendFrameRef.current);
+        sendFrameRef.current = null;
       }
       if (orientationHandlerRef.current) {
         window.removeEventListener('deviceorientation', orientationHandlerRef.current, true);
+        orientationHandlerRef.current = null;
       }
     };
   }, []);
 
-  const joinUrl = `${window.location.origin}?room=${roomCode}`;
+  const joinUrl = roomCode ? `${window.location.origin}?room=${roomCode}` : window.location.origin;
 
   const copyControllerLink = async () => {
     if (!roomCode) return;
@@ -516,7 +558,7 @@ function App() {
   return (
     <main className="app desktop">
       <section className={`panel ${controllerLinked ? 'panel-compact' : ''}`}>
-        <h1>AirPaddle Screen</h1>
+        <h1>AirPaddle</h1>
         <p className={`code ${controllerLinked ? 'code-compact' : ''}`}>{roomCode || '----'}</p>
         {!controllerLinked && roomCode && (
           <>
@@ -531,7 +573,7 @@ function App() {
         {controllerLinked && <p className="status">Controller connected</p>}
         {calibratedFlash && <p className="status calibrated">Calibrated!</p>}
         <div className={`scene-wrap ${controllerLinked ? 'scene-wrap-expanded' : ''}`}>
-          <DesktopScene gyro={gyro} targetPosition={paddleTarget} serveSignal={serveSignal} />
+          <DesktopScene gyroRef={gyroRef} targetPositionRef={paddleTargetRef} serveSignal={serveSignal} />
         </div>
       </section>
     </main>

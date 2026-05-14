@@ -11,16 +11,33 @@ const TABLE_WIDTH = 8;
 const TABLE_LENGTH = 16;
 const TABLE_HEIGHT = 0.42;
 const TABLE_TOP_Y = TABLE_HEIGHT / 2;
-const PADDLE_BASE_Y = TABLE_TOP_Y + 0.58;
+const PADDLE_RADIUS = 0.52;
+const PADDLE_THICKNESS = 0.18;
+const PADDLE_TABLE_CLEARANCE = 0.26;
+const PADDLE_Y_MIN = TABLE_TOP_Y + PADDLE_RADIUS + PADDLE_TABLE_CLEARANCE;
+const PADDLE_BASE_Y = PADDLE_Y_MIN + 0.12;
 const PADDLE_X_MIN = -2;
 const PADDLE_X_MAX = 2;
-const PADDLE_Y_MIN = 0.5;
-const PADDLE_Y_MAX = 3;
+const PADDLE_Y_MAX = 3.2;
 const NET_HEIGHT = 0.16;
 const NET_THICKNESS = 0.06;
 const ORIENTATION_SMOOTHING = 10;
 const POSITION_SMOOTHING = 20;
 const CONTROLLER_SEND_INTERVAL_MS = 16;
+const PADDLE_NEUTRAL_ROTATION = {
+  x: Math.PI / 2,
+  y: 0,
+  z: 0,
+};
+const PHONE_DEADZONE_DEG = 1.2;
+const PITCH_SENSITIVITY = 0.018;
+const YAW_SENSITIVITY = 0.011;
+const ROLL_SENSITIVITY = 0.015;
+const PADDLE_LIMITS = {
+  pitch: 0.52,
+  yaw: 0.42,
+  roll: 0.5,
+};
  
 function generateRoomCode() {
   return Math.floor(1000 + Math.random() * 9000).toString();
@@ -32,6 +49,15 @@ function isMobileDevice() {
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function angleDeltaDegrees(current, baseline) {
+  return ((((current - baseline) % 360) + 540) % 360) - 180;
+}
+
+function applyDeadzone(value, deadzone) {
+  if (Math.abs(value) <= deadzone) return 0;
+  return value > 0 ? value - deadzone : value + deadzone;
 }
 
 function Table() {
@@ -73,55 +99,48 @@ function Bounds() {
   return null;
 }
 
-function PlayerPaddle({ gyroRef, targetPositionRef }) {
+function PlayerPaddle({ gyroRef, targetPositionRef, calibrated }) {
   const { scene } = useGLTF('/paddle.glb');
   const paddleModel = useMemo(() => scene.clone(true), [scene]);
   const [ref, api] = useCylinder(() => ({
     type: 'Kinematic',
-    args: [0.52, 0.52, 0.18, 28],
+    args: [PADDLE_RADIUS, PADDLE_RADIUS, PADDLE_THICKNESS, 28],
     position: [0, PADDLE_BASE_Y, 5.8],
   }));
-  const eulerLiveRef = useRef(new THREE.Euler());
-  const eulerBaseRef = useRef(new THREE.Euler());
-  const qLiveRef = useRef(new THREE.Quaternion());
-  const qBaseRef = useRef(new THREE.Quaternion());
-  const qRelativeRef = useRef(new THREE.Quaternion());
-  const qDefaultRef = useRef(new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI / 2, 0, 0)));
-  const qFinalRef = useRef(new THREE.Quaternion());
-  const qSmoothedRef = useRef(new THREE.Quaternion().copy(qDefaultRef.current));
-  const eulerFinalRef = useRef(new THREE.Euler());
+  const qTargetRef = useRef(new THREE.Quaternion());
+  const qSmoothedRef = useRef(
+    new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(PADDLE_NEUTRAL_ROTATION.x, PADDLE_NEUTRAL_ROTATION.y, PADDLE_NEUTRAL_ROTATION.z, 'YXZ'),
+    ),
+  );
+  const eulerTargetRef = useRef(new THREE.Euler());
   const eulerSmoothedRef = useRef(new THREE.Euler());
   const smoothedPositionRef = useRef({ x: 0, y: PADDLE_BASE_Y });
 
   useFrame((_, delta) => {
     const gyro = gyroRef.current;
-    const targetPosition = targetPositionRef.current;
+    const targetPosition = calibrated ? targetPositionRef.current : { x: 0, y: PADDLE_BASE_Y };
     const live = gyro.live;
     const baseline = gyro.baseline;
 
-    eulerLiveRef.current.set(
-      THREE.MathUtils.degToRad(live.beta || 0),
-      THREE.MathUtils.degToRad(live.alpha || 0),
-      THREE.MathUtils.degToRad(-(live.gamma || 0)),
-      'YXZ',
-    );
-    eulerBaseRef.current.set(
-      THREE.MathUtils.degToRad(baseline.beta || 0),
-      THREE.MathUtils.degToRad(baseline.alpha || 0),
-      THREE.MathUtils.degToRad(-(baseline.gamma || 0)),
-      'YXZ',
-    );
+    const pitchDelta = calibrated
+      ? applyDeadzone(angleDeltaDegrees(live.beta || 0, baseline.beta || 0), PHONE_DEADZONE_DEG)
+      : 0;
+    const yawDelta = calibrated
+      ? applyDeadzone(angleDeltaDegrees(live.alpha || 0, baseline.alpha || 0), PHONE_DEADZONE_DEG)
+      : 0;
+    const rollDelta = calibrated
+      ? applyDeadzone(angleDeltaDegrees(live.gamma || 0, baseline.gamma || 0), PHONE_DEADZONE_DEG)
+      : 0;
 
-    qLiveRef.current.setFromEuler(eulerLiveRef.current);
-    qBaseRef.current.setFromEuler(eulerBaseRef.current);
-    qRelativeRef.current.copy(qBaseRef.current).invert().multiply(qLiveRef.current);
-    qFinalRef.current.multiplyQuaternions(qDefaultRef.current, qRelativeRef.current);
-    eulerFinalRef.current.setFromQuaternion(qFinalRef.current, 'YXZ');
-    eulerFinalRef.current.x = clamp(eulerFinalRef.current.x, Math.PI / 2 - 0.45, Math.PI / 2 + 0.45);
-    eulerFinalRef.current.y = clamp(eulerFinalRef.current.y, -0.55, 0.55);
-    eulerFinalRef.current.z = clamp(eulerFinalRef.current.z, -0.45, 0.45);
-    qFinalRef.current.setFromEuler(eulerFinalRef.current);
-    qSmoothedRef.current.slerp(qFinalRef.current, 1 - Math.exp(-ORIENTATION_SMOOTHING * delta));
+    eulerTargetRef.current.set(
+      PADDLE_NEUTRAL_ROTATION.x + clamp(pitchDelta * PITCH_SENSITIVITY, -PADDLE_LIMITS.pitch, PADDLE_LIMITS.pitch),
+      PADDLE_NEUTRAL_ROTATION.y + clamp(yawDelta * YAW_SENSITIVITY, -PADDLE_LIMITS.yaw, PADDLE_LIMITS.yaw),
+      PADDLE_NEUTRAL_ROTATION.z + clamp(-rollDelta * ROLL_SENSITIVITY, -PADDLE_LIMITS.roll, PADDLE_LIMITS.roll),
+      'YXZ',
+    );
+    qTargetRef.current.setFromEuler(eulerTargetRef.current);
+    qSmoothedRef.current.slerp(qTargetRef.current, 1 - Math.exp(-ORIENTATION_SMOOTHING * delta));
     eulerSmoothedRef.current.setFromQuaternion(qSmoothedRef.current, 'YXZ');
 
     const xPos = clamp(targetPosition.x, PADDLE_X_MIN, PADDLE_X_MAX);
@@ -146,7 +165,7 @@ function OpponentPaddle({ ballPositionRef }) {
   const paddleModel = useMemo(() => scene.clone(true), [scene]);
   const [ref, api] = useCylinder(() => ({
     type: 'Kinematic',
-    args: [0.52, 0.52, 0.18, 28],
+    args: [PADDLE_RADIUS, PADDLE_RADIUS, PADDLE_THICKNESS, 28],
     position: [0, PADDLE_BASE_Y, -5.8],
   }));
   const opponentXRef = useRef(0);
@@ -234,7 +253,40 @@ function CameraRig() {
   return null;
 }
 
-function DesktopScene({ gyroRef, targetPositionRef, serveSignal }) {
+function CalibrationGuide({ visible }) {
+  if (!visible) return null;
+
+  return (
+    <group position={[0, PADDLE_BASE_Y, 5.8]}>
+      <mesh>
+        <sphereGeometry args={[0.95, 32, 16]} />
+        <meshBasicMaterial color="#38bdf8" wireframe transparent opacity={0.34} depthWrite={false} />
+      </mesh>
+      <mesh rotation={[Math.PI / 2, 0, 0]}>
+        <torusGeometry args={[0.95, 0.012, 12, 96]} />
+        <meshBasicMaterial color="#22c55e" transparent opacity={0.8} depthWrite={false} />
+      </mesh>
+      <mesh rotation={[0, Math.PI / 2, 0]}>
+        <torusGeometry args={[0.95, 0.012, 12, 96]} />
+        <meshBasicMaterial color="#f97316" transparent opacity={0.8} depthWrite={false} />
+      </mesh>
+      <mesh rotation={[0, 0, Math.PI / 2]}>
+        <torusGeometry args={[0.95, 0.012, 12, 96]} />
+        <meshBasicMaterial color="#e879f9" transparent opacity={0.8} depthWrite={false} />
+      </mesh>
+      <mesh position={[0, 0.95, 0]}>
+        <coneGeometry args={[0.08, 0.22, 18]} />
+        <meshBasicMaterial color="#f8fafc" />
+      </mesh>
+      <mesh position={[0, 0.46, 0]}>
+        <cylinderGeometry args={[0.025, 0.025, 0.92, 12]} />
+        <meshBasicMaterial color="#f8fafc" />
+      </mesh>
+    </group>
+  );
+}
+
+function DesktopScene({ gyroRef, targetPositionRef, serveSignal, controllerLinked, calibrated }) {
   const ballPositionRef = useRef([0, 2.2, -5.8]);
 
   return (
@@ -255,10 +307,11 @@ function DesktopScene({ gyroRef, targetPositionRef, serveSignal }) {
           <Table />
           <Net />
           <Bounds />
-          <PlayerPaddle gyroRef={gyroRef} targetPositionRef={targetPositionRef} />
+          <PlayerPaddle gyroRef={gyroRef} targetPositionRef={targetPositionRef} calibrated={calibrated} />
           <OpponentPaddle ballPositionRef={ballPositionRef} />
           <Ball ballPositionRef={ballPositionRef} serveSignal={serveSignal} />
         </Physics>
+        <CalibrationGuide visible={controllerLinked && !calibrated} />
       </Suspense>
       <OrbitControls enablePan={false} enableZoom={false} minPolarAngle={0.9} maxPolarAngle={1.25} />
     </Canvas>
@@ -272,6 +325,7 @@ function App() {
   const [status, setStatus] = useState('Tap to connect');
   const [copied, setCopied] = useState(false);
   const [controllerLinked, setControllerLinked] = useState(false);
+  const [calibrated, setCalibrated] = useState(false);
   const gyroRef = useRef({
     live: { alpha: 0, beta: 0, gamma: 0 },
     baseline: { alpha: 0, beta: 0, gamma: 0 },
@@ -283,8 +337,8 @@ function App() {
   const lastSendAtRef = useRef(0);
   const orientationHandlerRef = useRef(null);
   const latestGyroRef = useRef({ alpha: 0, beta: 0, gamma: 0 });
-  const initialCalibrationSentRef = useRef(false);
   const calibrationOffsetRef = useRef({ alpha: 0, beta: 0, gamma: 0 });
+  const calibratedRef = useRef(false);
   const trackpadTouchRef = useRef(null);
   const controllerLinkedRef = useRef(false);
 
@@ -328,6 +382,8 @@ function App() {
 
   useEffect(() => {
     if (mobileView || !roomCode) return;
+    calibratedRef.current = false;
+    setCalibrated(false);
     joinRoom(roomCode);
     const onGyroData = ({ alpha, beta, gamma }) => {
       markControllerLinked();
@@ -350,11 +406,15 @@ function App() {
         ...gyroRef.current,
         baseline: calibrationOffsetRef.current,
       };
+      paddleTargetRef.current = { x: 0, y: PADDLE_BASE_Y };
+      calibratedRef.current = true;
+      setCalibrated(true);
       setCalibratedFlash(true);
       window.setTimeout(() => setCalibratedFlash(false), 1000);
     };
     const onPaddleMove = ({ dx = 0, dy = 0 }) => {
       markControllerLinked();
+      if (!calibratedRef.current) return;
       const moveScale = 0.01;
       paddleTargetRef.current = {
         x: clamp(paddleTargetRef.current.x + dx * moveScale, PADDLE_X_MIN, PADDLE_X_MAX),
@@ -414,7 +474,7 @@ function App() {
         return;
       }
       joinRoom(roomCode);
-      setStatus('Controller Connected - Tilt to move!');
+      setStatus('Controller connected. Hold a comfortable ready pose, then set neutral.');
       setControllerReady(true);
 
       if (sendFrameRef.current) {
@@ -425,8 +485,6 @@ function App() {
         window.removeEventListener('deviceorientation', orientationHandlerRef.current, true);
         orientationHandlerRef.current = null;
       }
-      initialCalibrationSentRef.current = false;
-
       const onOrientation = (event) => {
         const reading = {
           alpha: event.alpha ?? 0,
@@ -434,14 +492,6 @@ function App() {
           gamma: event.gamma ?? 0,
         };
         latestGyroRef.current = reading;
-
-        if (!initialCalibrationSentRef.current) {
-          initialCalibrationSentRef.current = true;
-          socket.emit('calibration_offset', {
-            roomCode,
-            ...reading,
-          });
-        }
       };
       orientationHandlerRef.current = onOrientation;
 
@@ -472,7 +522,7 @@ function App() {
       roomCode,
       ...baseline,
     });
-    setStatus('Calibrated. Current phone angle is now neutral.');
+    setStatus('Neutral set. Move from this comfortable pose to control the paddle.');
   };
 
   const handleTrackpadTouchStart = (event) => {
@@ -535,10 +585,10 @@ function App() {
           <h1>AirPaddle Controller</h1>
           <p className="room-tag">Room {roomCode || '----'}</p>
           <button className="cta" onClick={startController} disabled={!connected || controllerReady}>
-            Connect & Calibrate
+            Connect Controller
           </button>
           <button className="cta cta-secondary" onClick={calibrateController} disabled={!controllerReady}>
-            Calibrate / Recenter
+            Set Neutral / Recenter
           </button>
           <div
             className="trackpad"
@@ -570,10 +620,17 @@ function App() {
             </button>
           </>
         )}
-        {controllerLinked && <p className="status">Controller connected</p>}
+        {controllerLinked && !calibrated && <p className="status">Hold your phone naturally, then set neutral.</p>}
+        {controllerLinked && calibrated && <p className="status">Controller calibrated</p>}
         {calibratedFlash && <p className="status calibrated">Calibrated!</p>}
         <div className={`scene-wrap ${controllerLinked ? 'scene-wrap-expanded' : ''}`}>
-          <DesktopScene gyroRef={gyroRef} targetPositionRef={paddleTargetRef} serveSignal={serveSignal} />
+          <DesktopScene
+            gyroRef={gyroRef}
+            targetPositionRef={paddleTargetRef}
+            serveSignal={serveSignal}
+            controllerLinked={controllerLinked}
+            calibrated={calibrated}
+          />
         </div>
       </section>
     </main>
